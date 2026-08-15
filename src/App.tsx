@@ -31,7 +31,7 @@ function PdfPages({ file, data, onRendered }: { file: File; data: PaperMap; onRe
           if (boxes.length) {
             const minX = Math.min(...boxes.map((b) => b.x)); const minY = Math.min(...boxes.map((b) => b.y)); const maxX = Math.max(...boxes.map((b) => b.x + b.width)); const maxY = Math.max(...boxes.map((b) => b.y + b.height));
             Object.assign(mark.style, { left: `${minX * 100}%`, top: `${Math.max(0, minY - .018) * 100}%`, width: `${Math.min(.94 - minX, maxX - minX) * 100}%`, height: `${Math.max(.035, maxY - minY + .035) * 100}%` });
-          } else Object.assign(mark.style, { left: "8%", top: "12%", width: "84%", height: "5%" });
+          } else return;
           mark.onclick = () => document.getElementById(`card-${passage.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
           shell.appendChild(mark);
         });
@@ -44,10 +44,25 @@ function PdfPages({ file, data, onRendered }: { file: File; data: PaperMap; onRe
 }
 
 function Reader({ file, data, reset }: { file: File; data: PaperMap; reset: () => void }) {
-  const frame = useRef<HTMLDivElement>(null); const [beams, setBeams] = useState<Beam[]>([]); const [traceOpen, setTraceOpen] = useState(false);
+  const frame = useRef<HTMLDivElement>(null); const cardsHost = useRef<HTMLDivElement>(null); const [beams, setBeams] = useState<Beam[]>([]); const [traceOpen, setTraceOpen] = useState(false);
   const draw = useCallback(() => {
-    if (!frame.current || innerWidth < 900) return setBeams([]);
+    if (!frame.current || !cardsHost.current) return;
+    const cardElements = data.passages.map((p) => document.getElementById(`card-${p.id}`)).filter(Boolean) as HTMLElement[];
+    if (innerWidth < 900) { cardElements.forEach((card) => { card.style.position = ""; card.style.top = ""; card.style.width = ""; }); cardsHost.current.style.height = ""; return setBeams([]); }
     const fr = frame.current.getBoundingClientRect();
+    const cardsRect = cardsHost.current.getBoundingClientRect();
+    let previousBottom = 0;
+    data.passages.forEach((p) => {
+      const source = document.getElementById(`source-${p.id}`)?.getBoundingClientRect();
+      const card = document.getElementById(`card-${p.id}`);
+      if (!source || !card) return;
+      card.style.position = "absolute"; card.style.width = "100%";
+      const desired = source.top - cardsRect.top + source.height / 2 - 34;
+      const top = Math.max(8, desired, previousBottom + 24);
+      card.style.top = `${top}px`;
+      previousBottom = top + card.offsetHeight;
+    });
+    cardsHost.current.style.height = `${Math.max(previousBottom + 20, 280)}px`;
     setBeams(data.passages.flatMap((p) => { const a = document.getElementById(`source-${p.id}`)?.getBoundingClientRect(); const b = document.getElementById(`card-${p.id}`)?.getBoundingClientRect(); if (!a || !b) return []; const x1 = a.right - fr.left, y1 = a.top - fr.top + a.height / 2, x2 = b.left - fr.left - 12, y2 = b.top - fr.top + 24, mx = x1 + (x2 - x1) * .55; return [{ id: p.id, x1, y1, d: `M ${x1} ${y1} C ${mx} ${y1}, ${x1 + (x2 - x1) * .3} ${y2}, ${x2} ${y2}` }]; }));
   }, [data]);
   useEffect(() => { const resize = () => draw(); addEventListener("resize", resize); addEventListener("scroll", resize, true); return () => { removeEventListener("resize", resize); removeEventListener("scroll", resize, true); }; }, [draw]);
@@ -58,7 +73,7 @@ function Reader({ file, data, reset }: { file: File; data: PaperMap; reset: () =
     <div className="reader-frame" ref={frame}>
       <svg className="beams" aria-hidden="true"><defs><linearGradient id="beam-grad"><stop offset="0%" stopColor="#e0a83c" stopOpacity=".75"/><stop offset="100%" stopColor="#49c8b6" stopOpacity=".8"/></linearGradient><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#49c8b6"/></marker></defs>{beams.map((b) => <g key={b.id}><path d={b.d} stroke="url(#beam-grad)" strokeWidth="1.7" fill="none" markerEnd="url(#arrow)"/><circle cx={b.x1} cy={b.y1} r="3" fill="#e0a83c"/></g>)}</svg>
       <section className="paper-pane"><div className="pane-label"><span>Original paper</span><span>{data.pageCount} pages</span></div><PdfPages file={file} data={data} onRendered={draw}/></section>
-      <aside className="summary-pane"><div className="pane-label"><span>Mapped summary</span><span>{data.passages.length} sources</span></div><div className="cards">{data.passages.map((p: Passage, i) => <article className="summary-card" id={`card-${p.id}`} key={p.id}><div className="card-meta"><span>{sections.get(p.sectionId)?.label || `p.${p.page}`}</span><span>source {String(i + 1).padStart(2, "0")}</span></div><p>{p.summary}</p><button onClick={() => document.getElementById(`source-${p.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}>View passage <span>↗</span></button></article>)}</div>
+      <aside className="summary-pane"><div className="pane-label"><span>Mapped summary</span><span>{data.passages.length} sources</span></div><div className="cards" ref={cardsHost}>{data.passages.map((p: Passage, i) => <article className="summary-card" id={`card-${p.id}`} key={p.id}><div className="card-meta"><span>{sections.get(p.sectionId)?.label || `p.${p.page}`}</span><span>source {String(i + 1).padStart(2, "0")}</span></div><p>{p.summary}</p>{p.boxes.length ? <button onClick={() => document.getElementById(`source-${p.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}>View passage <span>↗</span></button> : <small className="unmapped">Source text extracted · exact layout unavailable</small>}</article>)}</div>
         <div className={`repo-card ${data.repo.status}`}><div className="repo-icon">⌘</div><div><span className="repo-label">{data.repo.status === "found" ? "Repository found in paper" : data.repo.status === "inferred" ? "Possible repository · inferred" : "Repository verdict"}</span>{data.repo.url ? <a href={data.repo.url} target="_blank" rel="noreferrer">{data.repo.label} ↗</a> : <strong>No public repository identified</strong>}<small>{data.repo.evidence}</small></div></div>
       </aside>
     </div>

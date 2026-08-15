@@ -1,5 +1,6 @@
 import base64
 import contextvars
+import difflib
 import json
 import os
 import re
@@ -100,23 +101,36 @@ class PaperContext:
 
     def _sections(self) -> List[Dict[str, Any]]:
         headings: List[Dict[str, Any]] = []
+        page_blocks: List[List[Any]] = []
         pattern = re.compile(r"^(\d+(?:\.\d+)*)\s+([A-Z][^\n]{2,80})$")
-        for page_index, text in enumerate(self.pages):
-            for match in pattern.finditer(text):
-                title = match.group(2).strip()
-                if len(title.split()) <= 12:
-                    headings.append({"label": match.group(1), "title": title, "page": page_index + 1})
+        for page_index, page in enumerate(self.doc):
+            blocks = page.get_text("blocks", sort=True)
+            page_blocks.append(blocks)
+            for block_index, block in enumerate(blocks):
+                line = " ".join(block[4].split())
+                match = pattern.match(line)
+                if match and len(match.group(2).split()) <= 12:
+                    headings.append({"label": match.group(1), "title": match.group(2).strip(), "page": page_index + 1, "block": block_index})
+                elif page_index == 0 and line.lower() == "abstract":
+                    headings.append({"label": "ABS", "title": "Abstract", "page": 1, "block": block_index})
         unique: List[Dict[str, Any]] = []
         for heading in headings:
             if not unique or (heading["label"], heading["title"]) != (unique[-1]["label"], unique[-1]["title"]):
                 unique.append(heading)
         if not unique:
             unique = [{"label": "p.{0}".format(i + 1), "title": "Paper overview" if i == 0 else "Page {0}".format(i + 1), "page": i + 1} for i in range(min(8, len(self.pages)))]
-        result = []
+            return [{"id": "s-{0}".format(i + 1), "label": item["label"], "title": item["title"], "pageStart": item["page"], "pageEnd": item["page"], "text": self.pages[item["page"] - 1][:18000]} for i, item in enumerate(unique)]
+        result: List[Dict[str, Any]] = []
         for i, heading in enumerate(unique[:18]):
-            end = unique[i + 1]["page"] if i + 1 < len(unique) else len(self.pages)
-            text = "\n".join(self.pages[heading["page"] - 1:end])[:18000]
-            result.append({"id": "s-{0}".format(i + 1), "label": heading["label"], "title": heading["title"], "pageStart": heading["page"], "pageEnd": end, "text": text})
+            next_heading = unique[i + 1] if i + 1 < len(unique) else None
+            end_page = next_heading["page"] if next_heading else len(self.pages)
+            chunks: List[str] = []
+            for page_no in range(heading["page"], end_page + 1):
+                start_block = heading["block"] if page_no == heading["page"] else 0
+                stop_block = next_heading["block"] if next_heading and page_no == next_heading["page"] else len(page_blocks[page_no - 1])
+                chunks.extend(block[4].strip() for block in page_blocks[page_no - 1][start_block:stop_block] if block[4].strip())
+            text = "\n".join(chunks)[:18000]
+            result.append({"id": "s-{0}".format(i + 1), "label": heading["label"], "title": heading["title"], "pageStart": heading["page"], "pageEnd": end_page, "text": text})
         return result
 
     def _figures(self) -> List[Dict[str, Any]]:
@@ -137,15 +151,35 @@ class PaperContext:
                     return found
         return found
 
-    def locate(self, text: str) -> Dict[str, Any]:
+    def locate(self, text: str, page_hint: Optional[int] = None) -> Dict[str, Any]:
         needle = " ".join(text.split())
-        candidates = [needle, " ".join(needle.split()[:14])]
-        for page_no, page in enumerate(self.doc, 1):
+        words = needle.split()
+        candidates = [needle, " ".join(words[:14]), " ".join(words[:9]), " ".join(words[:6])]
+        page_order = list(range(1, len(self.doc) + 1))
+        if page_hint in page_order:
+            page_order.remove(page_hint)
+            page_order.insert(0, page_hint)
+        for page_no in page_order:
+            page = self.doc[page_no - 1]
             for candidate in candidates:
                 rects = page.search_for(candidate, quads=False)
                 if rects:
                     return {"page": page_no, "boxes": [rect_json(rect, page_no, page.rect.width, page.rect.height) for rect in rects[:8]]}
-        return {"page": 1, "boxes": []}
+        best = (0.0, None, None)
+        normalized = re.sub(r"\W+", " ", needle.lower()).strip()
+        for page_no in page_order:
+            page = self.doc[page_no - 1]
+            for block in page.get_text("blocks", sort=True):
+                block_text = re.sub(r"\W+", " ", block[4].lower()).strip()
+                score = difflib.SequenceMatcher(None, normalized[:500], block_text[:700]).ratio()
+                if normalized[:80] and normalized[:80] in block_text:
+                    score += 0.5
+                if score > best[0]:
+                    best = (score, page_no, fitz.Rect(block[:4]))
+        if best[0] >= 0.18 and best[1] and best[2]:
+            page = self.doc[best[1] - 1]
+            return {"page": best[1], "boxes": [rect_json(best[2], best[1], page.rect.width, page.rect.height)]}
+        return {"page": page_hint or 1, "boxes": []}
 
     def metadata(self) -> Dict[str, str]:
         page = self.doc[0]
@@ -171,6 +205,30 @@ TOOLS = [
 ]
 
 
+def passage_candidates(text: str, limit: int = 2) -> List[str]:
+    clean = " ".join(text.split())
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", clean) if 70 <= len(part.strip()) <= 650]
+    signals = ("we propose", "we show", "we find", "our model", "results", "outperform", "architecture", "method", "however", "limitation", "attention", "algorithm")
+    scored = []
+    for index, sentence in enumerate(sentences):
+        lowered = sentence.lower()
+        score = sum(3 for signal in signals if signal in lowered) + min(len(sentence), 360) / 120 - index * .015
+        scored.append((score, index))
+    selected: List[str] = []
+    for _, index in sorted(scored, reverse=True):
+        parts = [sentences[index]]
+        if index + 1 < len(sentences) and len(parts[0]) + len(sentences[index + 1]) < 900:
+            parts.append(sentences[index + 1])
+        passage = " ".join(parts)
+        fingerprint = set(re.findall(r"\w+", passage.lower()))
+        if any(len(fingerprint & set(re.findall(r"\w+", prior.lower()))) / max(1, len(fingerprint)) > .72 for prior in selected):
+            continue
+        selected.append(passage)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 def execute_tool(ctx: PaperContext, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     reason = str(args.get("reason", "No reason supplied"))
     if name == "extract_sections":
@@ -185,11 +243,11 @@ def execute_tool(ctx: PaperContext, name: str, args: Dict[str, Any]) -> Dict[str
         section = next((item for item in ctx.sections if item["id"] == args.get("section_id")), None)
         if not section:
             return {"error": "Unknown section"}
-        schema = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"passage": {"type": "STRING"}}, "required": ["passage"]}}
-        records = gemini_json("Select 1-2 important passages from the section. Each must be an exact contiguous quote of 1-3 sentences. Return only JSON.\n\n{0}".format(section["text"]), schema)
         created = []
-        for record in records[:2]:
-            passage = {"id": "p-{0}".format(len(ctx.selected) + 1), "sectionId": section["id"], "text": record["passage"]}
+        for source_text in passage_candidates(section["text"], 2):
+            if any(source_text == existing["text"] for existing in ctx.selected):
+                continue
+            passage = {"id": "p-{0}".format(len(ctx.selected) + 1), "sectionId": section["id"], "text": source_text, "pageHint": section["pageStart"]}
             ctx.selected.append(passage)
             created.append(passage)
         ctx.log(name, reason, "{0} source passages selected from {1}".format(len(created), section["title"]))
@@ -198,11 +256,19 @@ def execute_tool(ctx: PaperContext, name: str, args: Dict[str, Any]) -> Dict[str
         passage = next((item for item in ctx.selected if item["id"] == args.get("passage_id")), None)
         if not passage:
             return {"error": "Unknown passage"}
-        schema = {"type": "OBJECT", "properties": {"summary": {"type": "STRING"}}, "required": ["summary"]}
-        summary = gemini_json("Explain this passage as one concise plain-language bullet in your own words. Never quote it.\n\n{0}".format(passage["text"]), schema)["summary"]
-        ctx.summaries[passage["id"]] = summary
-        ctx.log(name, reason, summary)
-        return {"passage_id": passage["id"], "summary": summary}
+        if passage["id"] in ctx.summaries:
+            ctx.log(name, reason, "Reused summary from the current paper's batch")
+            return {"passage_id": passage["id"], "summary": ctx.summaries[passage["id"]], "cached": True}
+        pending = [item for item in ctx.selected if item["id"] not in ctx.summaries]
+        schema = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"id": {"type": "STRING"}, "summary": {"type": "STRING"}}, "required": ["id", "summary"]}}
+        prompt = "Write one substantial plain-language bullet for every source passage below. Each bullet should be 45-80 words across 2-3 sentences: explain the claim, why it matters, and any important qualification. Use your own words and never quote the source. Return every id exactly once.\n\n" + "\n\n".join("{0}: {1}".format(item["id"], item["text"]) for item in pending)
+        records = gemini_json(prompt, schema)
+        for record in records:
+            if any(item["id"] == record.get("id") for item in pending):
+                ctx.summaries[record["id"]] = record["summary"]
+        summary = ctx.summaries.get(passage["id"], "")
+        ctx.log(name, reason, "Batched {0} passage summaries in one model call".format(len(records)))
+        return {"passage_id": passage["id"], "summary": summary, "batched_ids": [record.get("id") for record in records]}
     if name == "describe_figure":
         figure = next((item for item in ctx.figures if item["id"] == args.get("figure_id")), None)
         if not figure:
@@ -234,19 +300,19 @@ def execute_tool(ctx: PaperContext, name: str, args: Dict[str, Any]) -> Dict[str
 def local_fallback(ctx: PaperContext) -> None:
     for item in ctx.selected:
         if item["id"] not in ctx.summaries:
-            ctx.summaries[item["id"]] = item["text"][:187] + ("…" if len(item["text"]) > 187 else "")
+            ctx.summaries[item["id"]] = "Key evidence from the paper: " + item["text"][:520] + ("…" if len(item["text"]) > 520 else "")
     used_sections = {item["sectionId"] for item in ctx.selected}
     for section in ctx.sections:
         if len(ctx.selected) >= 6:
             break
         if section["id"] in used_sections:
             continue
-        sentences = [part.strip() for part in re.findall(r"[^.!?]+[.!?]+", section["text"]) if 100 < len(part.strip()) < 520]
-        text = max(sentences, key=len) if sentences else " ".join(section["text"].split())[:360]
-        if text:
-            item = {"id": "p-{0}".format(len(ctx.selected) + 1), "sectionId": section["id"], "text": text}
+        candidates = passage_candidates(section["text"], 1)
+        text = candidates[0] if candidates else " ".join(section["text"].split())[:520]
+        if text and not any(text == existing["text"] for existing in ctx.selected):
+            item = {"id": "p-{0}".format(len(ctx.selected) + 1), "sectionId": section["id"], "text": text, "pageHint": section["pageStart"]}
             ctx.selected.append(item)
-            ctx.summaries[item["id"]] = item["text"][:187] + ("…" if len(item["text"]) > 187 else "")
+            ctx.summaries[item["id"]] = "Key evidence from the paper: " + text
     execute_tool(ctx, "find_repo", {"reason": "Complete the repository verdict in local fallback mode."})
 
 
@@ -256,6 +322,8 @@ def orchestrate(ctx: PaperContext) -> None:
         local_fallback(ctx)
         return
     prompt = """You are Marginal's orchestrator agent. Build a complete evidence-backed map of this research paper. You decide which tools to call and in what order. Always call extract_sections and find_repo. Select 4-8 passages across the most important sections, then call summarize_passage for every selected passage. Call extract_figures only if the paper has useful figures/tables and describe only the most explanatory visuals. Call propose_repo only when find_repo is empty and the paper clearly implies public software. Never treat an inferred repo as found. Every tool call must include your concise reason. Call finish only when the map and repo verdict are complete.
+
+Batch independent tool calls together whenever possible and complete the plan within four orchestration turns to respect free-tier limits.
 
 Paper: {0}
 Pages: {1}
@@ -291,10 +359,12 @@ def result_json(ctx: PaperContext) -> Dict[str, Any]:
     for item in ctx.selected:
         if item["id"] not in ctx.summaries:
             continue
-        location = ctx.locate(item["text"])
-        passages.append({**item, "summary": ctx.summaries[item["id"]], "page": location["page"], "boxes": location["boxes"], "kind": "passage"})
+        location = ctx.locate(item["text"], item.get("pageHint"))
+        public_item = {key: value for key, value in item.items() if key != "pageHint"}
+        passages.append({**public_item, "summary": ctx.summaries[item["id"]], "page": location["page"], "boxes": location["boxes"], "kind": "passage"})
     figures = [{"id": figure["id"], "page": figure["page"], "caption": figure["caption"], "summary": ctx.figure_summaries[figure["id"]], "box": figure["box"]} for figure in ctx.figures if figure["id"] in ctx.figure_summaries]
     passages.extend({"id": figure["id"], "sectionId": "figure", "text": figure["caption"], "summary": figure["summary"], "page": figure["page"], "boxes": [figure["box"]], "kind": "figure"} for figure in figures)
+    passages.sort(key=lambda item: (item["page"], item["boxes"][0]["y"] if item["boxes"] else 2))
     return {**ctx.metadata(), "pageCount": len(ctx.doc), "sections": ctx.sections, "passages": passages, "figures": figures, "repo": ctx.repo, "trace": ctx.trace, "mode": ctx.mode}
 
 
