@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PaperMap, Passage } from "@/lib/types";
+import type { PaperMap, Passage } from "./types";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 type Beam = { id: string; d: string; x1: number; y1: number };
 
@@ -11,7 +12,7 @@ function PdfPages({ file, data, onRendered }: { file: File; data: PaperMap; onRe
     let cancelled = false;
     (async () => {
       const pdfjs = await import("pdfjs-dist");
-      pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
       const doc = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
       if (!host.current || cancelled) return;
       host.current.innerHTML = "";
@@ -61,7 +62,7 @@ function Reader({ file, data, reset }: { file: File; data: PaperMap; reset: () =
         <div className={`repo-card ${data.repo.status}`}><div className="repo-icon">⌘</div><div><span className="repo-label">{data.repo.status === "found" ? "Repository found in paper" : data.repo.status === "inferred" ? "Possible repository · inferred" : "Repository verdict"}</span>{data.repo.url ? <a href={data.repo.url} target="_blank" rel="noreferrer">{data.repo.label} ↗</a> : <strong>No public repository identified</strong>}<small>{data.repo.evidence}</small></div></div>
       </aside>
     </div>
-    {data.mode === "local" && <div className="mode-banner">Local preview mode — add <code>GEMINI_API_KEY</code> for agent-written summaries and repo inference.</div>}
+    {data.mode === "local" && <div className="mode-banner">Local preview mode — Gemini is unavailable, unconfigured, or rate-limited. Details are recorded in the agent trace.</div>}
     {traceOpen && <div className="modal-backdrop" onMouseDown={() => setTraceOpen(false)}><section className="trace-panel" onMouseDown={(e) => e.stopPropagation()}><header><div><span className="trace-kicker">Orchestrator trace</span><h2>How this summary was built</h2></div><button onClick={() => setTraceOpen(false)} aria-label="Close">×</button></header><div className="trace-list">{data.trace.map((step, i) => <div className="trace-step" key={`${step.tool}-${i}`}><span>{String(i + 1).padStart(2, "0")}</span><div><code>{step.tool}()</code><p>{step.reason}</p><small>{step.result}</small></div></div>)}</div></section></div>}
   </main>;
 }

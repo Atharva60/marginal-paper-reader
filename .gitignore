@@ -1,5 +1,10 @@
 .next
+dist
 node_modules
 .env
 .env.local
 npm-debug.log*
+__pycache__
+*.py[cod]
+*.tsbuildinfo
+.venv
