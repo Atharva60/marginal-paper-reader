@@ -389,6 +389,11 @@ async def analyze(paper: UploadFile = File(...)) -> Dict[str, Any]:
         raise HTTPException(500, str(exc))
 
 
+@app.get("/architecture", include_in_schema=False)
+def architecture_page():
+    return FileResponse(ROOT / "docs" / "architecture.html")
+
+
 DIST = ROOT / "dist"
 if DIST.exists():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
