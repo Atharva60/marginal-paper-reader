@@ -2,7 +2,7 @@
 
 Marginal is an evidence-first research-paper reader. Upload a PDF and it renders the original paper beside a structured explanation, with every summary card connected to the passage, figure, or table that supports it.
 
-The application uses a React frontend and a Python/FastAPI backend. Gemini acts as an orchestrator: it chooses which analysis tools a paper needs, records why each tool was called, and produces a traceable paper map rather than an ungrounded summary.
+The application uses a React frontend and a Python/FastAPI backend. A LangGraph `StateGraph` coordinates deterministic PDF tools and Gemini decisions through typed shared state, conditional edges, validation, bounded repair, and in-memory checkpoints.
 
 > [Open the standalone project and architecture overview](docs/architecture.html). When the app is running, it is also available at `/architecture`.
 
@@ -30,8 +30,8 @@ React upload ───────────────► POST /api/analyze
                                      │
                     ┌────────────────┴────────────────┐
                     ▼                                 ▼
-             PyMuPDF extraction                Gemini orchestrator
-         sections · blocks · figures        chooses tools + gives reasons
+             PyMuPDF extraction             LangGraph StateGraph
+         sections · blocks · figures      nodes · state · conditional edges
                     │                                 │
                     └──────────────┬──────────────────┘
                                    ▼
@@ -43,7 +43,23 @@ React upload ───────────────► POST /api/analyze
                   PDF highlights ⇢ SVG beams ⇢ summary cards
 ```
 
-The backend—not the browser—loads `GEMINI_API_KEY`. Uploaded PDFs are processed in memory and are not written to the repository.
+The backend—not the browser—loads `GEMINI_API_KEY`. Uploaded PDFs are processed in memory and are not written to the repository. Each request receives a checkpointed LangGraph thread derived from its paper identity.
+
+### LangGraph nodes
+
+| Node | State transition |
+| --- | --- |
+| `extract` | Initializes section, figure, metadata, and trace state from PyMuPDF. |
+| `plan` | Uses Gemini function calling once to choose relevant sections, vision, and repository inference branches. |
+| `select_passages` | Creates exact, deterministic source work items. |
+| `summarize` | Batches pending summaries into one Gemini request or uses local fallback. |
+| `figures` | Conditionally describes the highest-priority visual. |
+| `repository` | Resolves explicit URLs before any inferred candidate. |
+| `validate` | Enforces passage, summary, and repository invariants. |
+| `repair` | Deterministically repairs incomplete state once. |
+| `finalize` | Marks the graph complete and freezes the API result. |
+
+Conditional edges route `summarize → figures | repository` and `validate → repair | finalize`. `InMemorySaver` checkpoints each superstep for the request thread.
 
 ### Agent tools
 
@@ -68,15 +84,16 @@ Every tool call includes the orchestrator’s stated reason and is exposed in th
 | PDF viewer | `pdfjs-dist` |
 | API | Python, FastAPI, Uvicorn |
 | PDF extraction | PyMuPDF |
-| AI | Google Gemini with function calling |
+| Orchestration | LangGraph `StateGraph` with `InMemorySaver` |
+| AI | Google Gemini function-calling plan, structured summaries, and vision |
 | Deployment | Render Blueprint, one Python web service |
 
 ## Local setup
 
-Requirements: Node.js 20+, Python 3.9+, and a [Gemini API key](https://aistudio.google.com/apikey).
+Requirements: Node.js 20+, Python 3.10+, and a [Gemini API key](https://aistudio.google.com/apikey).
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 npm install
 ```
@@ -119,7 +136,8 @@ The included `render.yaml` creates a free Render Python service. Add `GEMINI_API
 ## Project structure
 
 ```text
-backend/main.py         API, extraction tools, orchestrator, static serving
+backend/main.py         FastAPI transport and static serving
+backend/pipeline.py     LangGraph state, nodes, edges, extraction and Gemini services
 docs/architecture.html  Standalone visual system overview
 src/App.tsx             Upload and evidence-map interface
 src/index.css           Marginal design system and responsive layout
@@ -131,7 +149,7 @@ vite.config.ts          React build and API proxy
 
 ## Quota behavior
 
-Marginal selects passages locally and batches pending summaries into one Gemini call. A per-paper request budget prevents stalled uploads. If Gemini is unavailable or rate-limited, the backend returns a longer extractive evidence map and records the fallback reason in the trace.
+Marginal selects passages locally and batches pending summaries into one Gemini call. A per-paper request budget prevents stalled uploads. If Gemini is unavailable or rate-limited, the graph stays on its deterministic path, validates the result, performs at most one repair pass, and records the transition in the trace.
 
 ## Privacy and confidence
 
